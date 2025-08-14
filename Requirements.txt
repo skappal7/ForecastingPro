@@ -6,3 +6,9 @@ plotly
 scikit-learn
 openpyxl
 xlrd
+
+# Advanced forecasting (add these after basic deployment works)
+# prophet
+# pmdarima
+# holidays
+# xlsxwriter
