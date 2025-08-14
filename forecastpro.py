@@ -1,3 +1,14 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+try:
+    # Try the new ARIMA API (statsmodels >=0.12)
+    from statsmodels.tsa.arima.model import ARIMA
+except ImportError:
+    # Fallback to legacy ARIMA API (statsmodels <0.12)
+    from statsmodels.tsa.arima_model import ARIMA
+    print("Warning: Using legacy ARIMA API. Consider upgrading statsmodels>=0.12 for full compatibility.")
+
 import streamlit as st
 import pandas as pd
 import numpy as np
