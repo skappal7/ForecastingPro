@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from prophet import Prophet
+from neuralprophet import NeuralProphet
 import pmdarima as pm
 from sklearn.ensemble import IsolationForest
 import plotly.graph_objects as go
