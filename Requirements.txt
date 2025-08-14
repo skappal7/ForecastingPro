@@ -2,9 +2,9 @@ streamlit
 pandas
 numpy
 plotly
-statsmodels
 prophet
+pmdarima
 scikit-learn
 xlsxwriter
-openpyxl# For reading Excel files
-xlrd# Legacy Excel support
+openpyxl
+xlrd
