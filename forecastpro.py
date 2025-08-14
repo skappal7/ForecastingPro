@@ -3,13 +3,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from neuralprophet import NeuralProphet
-import pmdarima as pm
-from sklearn.ensemble import IsolationForest
-import plotly.graph_objects as go
-import plotly.express as px
-from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
-from concurrent.futures import ThreadPoolExecutor
 import warnings
 import io
 import json
@@ -17,6 +10,20 @@ import json
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Time Series Forecasting Dashboard", layout="wide")
+
+# -------------------------------
+# Import forecasting libraries
+# -------------------------------
+try:
+    from neuralprophet import NeuralProphet
+except ImportError:
+    st.error("NeuralProphet not installed properly. Check requirements.txt for PyTorch dependencies.")
+import pmdarima as pm
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+import plotly.graph_objects as go
+import plotly.express as px
+from concurrent.futures import ThreadPoolExecutor
 
 # -------------------------------
 # Custom CSS
@@ -32,7 +39,7 @@ h1, h2, h3 {color: #1F2937;}
 """, unsafe_allow_html=True)
 
 # -------------------------------
-# Animated loader HTML/CSS
+# Loader HTML
 # -------------------------------
 loader_html = """
 <div style="display:flex;justify-content:center;align-items:center;height:50px;">
@@ -74,7 +81,7 @@ def preprocess_data(df, time_col):
     return df
 
 # -------------------------------
-# Forecasting functions with caching
+# Forecasting functions
 # -------------------------------
 @st.cache_data(show_spinner=False)
 def cached_forecast_auto_arima(series, steps):
@@ -83,16 +90,13 @@ def cached_forecast_auto_arima(series, steps):
     return forecast
 
 @st.cache_data(show_spinner=False)
-def cached_forecast_prophet(df, time_col, value_col, periods, holidays=None, custom_seasonality=None):
-    df_prophet = df[[time_col, value_col]].rename(columns={time_col:'ds', value_col:'y'})
-    model = Prophet(holidays=holidays)
-    if custom_seasonality:
-        for season in custom_seasonality:
-            model.add_seasonality(name=season['name'], period=season['period'], fourier_order=season['fourier_order'])
-    model.fit(df_prophet)
-    future = model.make_future_dataframe(periods=periods)
+def cached_forecast_neuralprophet(df, time_col, value_col, periods):
+    df_np = df[[time_col, value_col]].rename(columns={time_col:'ds', value_col:'y'})
+    model = NeuralProphet()
+    model.fit(df_np, freq='D')
+    future = model.make_future_dataframe(df_np, periods=periods)
     forecast = model.predict(future)
-    return forecast[['ds','yhat','yhat_lower','yhat_upper']]
+    return forecast[['ds','yhat1']]
 
 # -------------------------------
 # Anomaly detection
@@ -111,31 +115,13 @@ def detect_anomalies_iforest(series):
     return series[pred==-1]
 
 # -------------------------------
-# Insights & plotting
+# Plotting functions
 # -------------------------------
-def generate_insights(df, metric, anomalies):
-    insights = []
-    series = df[metric]
-    if series.iloc[-1] > series.mean():
-        insights.append(f"Metric {metric} is currently above its historical average.")
-    if len(anomalies)>0:
-        for date, value in anomalies.items():
-            insights.append(f"Anomaly detected in {metric} on {date.date()} with value {value:.2f}.")
-    return insights
-
-def compute_model_metrics(series, forecast):
-    min_len = min(len(series), len(forecast))
-    rmse = mean_squared_error(series[-min_len:], forecast[-min_len:], squared=False)
-    mape = mean_absolute_percentage_error(series[-min_len:], forecast[-min_len:])
-    return rmse, mape
-
 def plot_forecast(df, forecast_df, time_col, metric):
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df[time_col], y=df[metric], mode='lines', name='Actual'))
-    if 'yhat' in forecast_df.columns:
-        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat'], mode='lines', name='Forecast'))
-        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat_upper'], mode='lines', name='Upper', line=dict(dash='dash')))
-        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat_lower'], mode='lines', name='Lower', line=dict(dash='dash')))
+    if 'yhat1' in forecast_df.columns:
+        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat1'], mode='lines', name='Forecast'))
     else:
         fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df, mode='lines', name='Forecast'))
     fig.update_layout(title=f"Forecast for {metric}", xaxis_title=time_col, yaxis_title=metric)
@@ -149,8 +135,14 @@ def plot_anomalies(df, time_col, metric, anomalies):
     fig.update_layout(title=f"Anomalies in {metric}", xaxis_title=time_col, yaxis_title=metric)
     return fig
 
+def compute_model_metrics(series, forecast):
+    min_len = min(len(series), len(forecast))
+    rmse = mean_squared_error(series[-min_len:], forecast[-min_len:], squared=False)
+    mape = mean_absolute_percentage_error(series[-min_len:], forecast[-min_len:])
+    return rmse, mape
+
 # -------------------------------
-# Sidebar controls
+# Sidebar
 # -------------------------------
 st.sidebar.title("Controls")
 uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv","xlsx"])
@@ -160,40 +152,19 @@ if uploaded_file:
     time_col_auto = detect_time_column(df)
     time_col = st.sidebar.selectbox("Select Time Column", df.columns, index=df.columns.get_loc(time_col_auto) if time_col_auto else 0)
     df = preprocess_data(df, time_col)
-
+    
     metric_options = df.select_dtypes(include=np.number).columns.tolist()
-    metrics_selected = st.sidebar.multiselect("Select Metrics to Forecast", metric_options, default=metric_options[:1])
-
-    # ------------------ Interactive Horizon ------------------
+    metrics_selected = st.sidebar.multiselect("Select Metrics", metric_options, default=metric_options[:1])
+    
     horizon_dict = {}
     st.sidebar.markdown("**Forecast Horizon per Metric (days)**")
     for metric in metrics_selected:
-        horizon_dict[metric] = st.sidebar.slider(f"{metric} horizon", min_value=1, max_value=365, value=7)
-
-    models_selected = st.sidebar.multiselect("Select Models", ["Auto-ARIMA","Prophet"], default=["Auto-ARIMA","Prophet"])
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Optional:** Upload holidays CSV with column 'ds' for Prophet")
-    holiday_file = st.sidebar.file_uploader("Upload Holidays CSV", type=["csv"])
-    holidays_df = None
-    if holiday_file:
-        holidays_df = pd.read_csv(holiday_file)
-        if 'ds' in holidays_df.columns:
-            holidays_df['ds'] = pd.to_datetime(holidays_df['ds'])
-        else:
-            st.sidebar.warning("Holiday file must have a 'ds' column")
-
-    st.sidebar.markdown("**Optional:** Add custom seasonalities for Prophet")
-    custom_seasonality_input = st.sidebar.text_area("Enter as JSON list e.g., [{'name':'monthly','period':30.5,'fourier_order':5}]", "")
-    custom_seasonality = None
-    if custom_seasonality_input:
-        try:
-            custom_seasonality = json.loads(custom_seasonality_input)
-        except:
-            st.sidebar.warning("Invalid JSON format for custom seasonalities")
+        horizon_dict[metric] = st.sidebar.slider(f"{metric} horizon", 1, 365, 7)
+    
+    models_selected = st.sidebar.multiselect("Select Models", ["Auto-ARIMA","NeuralProphet"], default=["Auto-ARIMA","NeuralProphet"])
 
 # -------------------------------
-# Forecasting function for threading
+# Forecasting function
 # -------------------------------
 def run_forecast_for_metric(metric):
     horizon = horizon_dict[metric]
@@ -205,18 +176,16 @@ def run_forecast_for_metric(metric):
             results['Auto-ARIMA'] = {'forecast': arima_forecast, 'rmse': rmse, 'mape': mape}
         except:
             st.warning(f"Auto-ARIMA failed for {metric}")
-    if "Prophet" in models_selected:
+    if "NeuralProphet" in models_selected:
         try:
-            prophet_forecast = cached_forecast_prophet(df, time_col, metric, horizon,
-                                                        holidays=holidays_df,
-                                                        custom_seasonality=custom_seasonality)
+            np_forecast = cached_forecast_neuralprophet(df, time_col, metric, horizon)
             y_true = df[metric].values[-horizon:]
-            y_pred = prophet_forecast['yhat'].values[-horizon:]
+            y_pred = np_forecast['yhat1'].values[-horizon:]
             rmse = mean_squared_error(y_true, y_pred, squared=False)
             mape = mean_absolute_percentage_error(y_true, y_pred)
-            results['Prophet'] = {'forecast': prophet_forecast, 'rmse': rmse, 'mape': mape}
+            results['NeuralProphet'] = {'forecast': np_forecast, 'rmse': rmse, 'mape': mape}
         except:
-            st.warning(f"Prophet failed for {metric}")
+            st.warning(f"NeuralProphet failed for {metric}")
     return metric, results
 
 # -------------------------------
@@ -224,111 +193,29 @@ def run_forecast_for_metric(metric):
 # -------------------------------
 if uploaded_file:
     st.title("Time Series Forecasting Dashboard")
-    tabs = st.tabs(["Data Preview","Forecasting","Anomalies","Insights","Download Results","Model Comparison"])
-
-    # --- Data Preview ---
-    with tabs[0]:
-        st.subheader("Raw Data")
-        st.dataframe(df.head())
-        st.write("Summary Statistics")
-        st.dataframe(df.describe())
-
-    # --- Forecasting ---
-    with tabs[1]:
-        st.subheader("Forecasts")
-        forecast_results = {}
-        loader_placeholder = st.empty()
-        with loader_placeholder.container():
-            st.markdown(loader_html, unsafe_allow_html=True)
-            st.write("Running multi-metric forecasting. Please wait...")
-            with ThreadPoolExecutor(max_workers=min(4, len(metrics_selected))) as executor:
-                futures = [executor.submit(run_forecast_for_metric, metric) for metric in metrics_selected]
-                for future in futures:
-                    metric, results = future.result()
-                    forecast_results[metric] = results
-        loader_placeholder.empty()
-
-        for metric in metrics_selected:
-            st.markdown(f"### Forecast for {metric}")
-            results = forecast_results[metric]
-            metrics_df = pd.DataFrame({
-                'Model': [k for k in results.keys()],
-                'RMSE': [v['rmse'] for v in results.values()],
-                'MAPE': [v['mape'] for v in results.values()]
-            })
-            best_model = metrics_df.sort_values('RMSE').iloc[0]['Model']
-            forecast_df = results[best_model]['forecast']
-            st.write(f"**Selected Model:** {best_model}")
-            st.dataframe(metrics_df)
-            fig = plot_forecast(df, forecast_df, time_col, metric)
-            st.plotly_chart(fig, use_container_width=True)
-
-            if 'yhat' in forecast_df.columns:
-                forecast_value = forecast_df['yhat'].iloc[-1]
-            else:
-                forecast_value = forecast_df.iloc[-1]
-            current_value = df[metric].iloc[-1]
-            st.markdown(f"""
-                <div class="metric-card">
-                    <h4>{metric} Forecast</h4>
-                    <p>Current Value: {current_value:.2f}</p>
-                    <p>Forecasted Value: {forecast_value:.2f}</p>
-                </div>
-            """, unsafe_allow_html=True)
-
-    # --- Anomalies ---
-    with tabs[2]:
-        st.subheader("Anomaly Detection")
-        anomalies_all = {}
-        for metric in metrics_selected:
-            st.markdown(f"### Anomalies in {metric}")
-            anomalies_stat = detect_anomalies_stat(df[metric])
-            anomalies_if = detect_anomalies_iforest(df[metric])
-            anomalies_combined = pd.concat([anomalies_stat, anomalies_if]).drop_duplicates()
-            anomalies_all[metric] = anomalies_combined
-            fig_anom = plot_anomalies(df, time_col, metric, anomalies_combined)
-            st.plotly_chart(fig_anom, use_container_width=True)
-            st.write(f"Detected {len(anomalies_combined)} anomalies.")
-
-    # --- Insights ---
-    with tabs[3]:
-        st.subheader("Auto-generated Insights")
-        for metric in metrics_selected:
-            anomalies_combined = anomalies_all.get(metric, pd.Series())
-            insights = generate_insights(df, metric, anomalies_combined)
-            st.markdown(f"### Insights for {metric}")
-            for ins in insights:
-                st.write("- " + ins)
-
-    # --- Download Results ---
-    with tabs[4]:
-        st.subheader("Download Forecast Results")
-        for metric in metrics_selected:
-            results = forecast_results[metric]
-            best_model = pd.DataFrame({
-                'Model': [k for k in results.keys()],
-                'RMSE': [v['rmse'] for v in results.values()],
-                'MAPE': [v['mape'] for v in results.values()]
-            }).sort_values('RMSE').iloc[0]['Model']
-            forecast_df = results[best_model]['forecast']
-            st.markdown(f"**{metric} - {best_model} Forecast**")
-            csv = forecast_df.to_csv(index=False).encode()
-            excel_buffer = io.BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-                forecast_df.to_excel(writer, sheet_name=f'{metric}_Forecast', index=False)
-            st.download_button(label=f"Download {metric} CSV", data=csv, file_name=f"{metric}_forecast.csv", mime='text/csv')
-            st.download_button(label=f"Download {metric} Excel", data=excel_buffer, file_name=f"{metric}_forecast.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-    # --- Model Comparison ---
-    with tabs[5]:
-        st.subheader("Model Comparison (RMSE / MAPE)")
-        comparison_rows = []
-        for metric in metrics_selected:
-            results = forecast_results[metric]
-            for model_name, metrics in results.items():
-                comparison_rows.append({'Metric': metric, 'Model': model_name, 'RMSE': metrics['rmse'], 'MAPE': metrics['mape']})
-        comparison_df = pd.DataFrame(comparison_rows)
-        fig_rmse = px.bar(comparison_df, x='Metric', y='RMSE', color='Model', barmode='group', title="RMSE Comparison")
-        fig_mape = px.bar(comparison_df, x='Metric', y='MAPE', color='Model', barmode='group', title="MAPE Comparison")
-        st.plotly_chart(fig_rmse, use_container_width=True)
-        st.plotly_chart(fig_mape, use_container_width=True)
+    forecast_results = {}
+    loader_placeholder = st.empty()
+    with loader_placeholder.container():
+        st.markdown(loader_html, unsafe_allow_html=True)
+        st.write("Running multi-metric forecasting. Please wait...")
+        with ThreadPoolExecutor(max_workers=min(4, len(metrics_selected))) as executor:
+            futures = [executor.submit(run_forecast_for_metric, metric) for metric in metrics_selected]
+            for future in futures:
+                metric, results = future.result()
+                forecast_results[metric] = results
+    loader_placeholder.empty()
+    
+    for metric in metrics_selected:
+        st.markdown(f"### Forecast for {metric}")
+        results = forecast_results[metric]
+        metrics_df = pd.DataFrame({
+            'Model':[k for k in results.keys()],
+            'RMSE':[v['rmse'] for v in results.values()],
+            'MAPE':[v['mape'] for v in results.values()]
+        })
+        best_model = metrics_df.sort_values('RMSE').iloc[0]['Model']
+        forecast_df = results[best_model]['forecast']
+        st.write(f"**Selected Model:** {best_model}")
+        st.dataframe(metrics_df)
+        fig = plot_forecast(df, forecast_df, time_col, metric)
+        st.plotly_chart(fig, use_container_width=True)
