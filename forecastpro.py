@@ -1,21 +1,10 @@
-import warnings
-warnings.filterwarnings("ignore")
-
-try:
-    # Try the new ARIMA API (statsmodels >=0.12)
-    from statsmodels.tsa.arima.model import ARIMA
-except ImportError:
-    # Fallback to legacy ARIMA API (statsmodels <0.12)
-    from statsmodels.tsa.arima_model import ARIMA
-    print("Warning: Using legacy ARIMA API. Consider upgrading statsmodels>=0.12 for full compatibility.")
-
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from prophet import Prophet
+import pmdarima as pm
 from sklearn.ensemble import IsolationForest
 import plotly.graph_objects as go
 import plotly.express as px
@@ -24,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import warnings
 import io
 import json
+
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Time Series Forecasting Dashboard", layout="wide")
@@ -87,16 +77,10 @@ def preprocess_data(df, time_col):
 # Forecasting functions with caching
 # -------------------------------
 @st.cache_data(show_spinner=False)
-def cached_forecast_arima(series, steps):
-    model = ARIMA(series, order=(5,1,0))
-    model_fit = model.fit()
-    return model_fit.forecast(steps=steps)
-
-@st.cache_data(show_spinner=False)
-def cached_forecast_ets(series, steps):
-    model = ExponentialSmoothing(series, seasonal=None)
-    model_fit = model.fit()
-    return model_fit.forecast(steps)
+def cached_forecast_auto_arima(series, steps):
+    model = pm.auto_arima(series, seasonal=False, stepwise=True, suppress_warnings=True)
+    forecast = model.predict(n_periods=steps)
+    return forecast
 
 @st.cache_data(show_spinner=False)
 def cached_forecast_prophet(df, time_col, value_col, periods, holidays=None, custom_seasonality=None):
@@ -186,7 +170,7 @@ if uploaded_file:
     for metric in metrics_selected:
         horizon_dict[metric] = st.sidebar.slider(f"{metric} horizon", min_value=1, max_value=365, value=7)
 
-    models_selected = st.sidebar.multiselect("Select Models", ["ARIMA","ETS","Prophet"], default=["ARIMA","Prophet"])
+    models_selected = st.sidebar.multiselect("Select Models", ["Auto-ARIMA","Prophet"], default=["Auto-ARIMA","Prophet"])
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("**Optional:** Upload holidays CSV with column 'ds' for Prophet")
@@ -214,20 +198,13 @@ if uploaded_file:
 def run_forecast_for_metric(metric):
     horizon = horizon_dict[metric]
     results = {}
-    if "ARIMA" in models_selected:
+    if "Auto-ARIMA" in models_selected:
         try:
-            arima_forecast = cached_forecast_arima(df[metric], horizon)
+            arima_forecast = cached_forecast_auto_arima(df[metric], horizon)
             rmse, mape = compute_model_metrics(df[metric], arima_forecast)
-            results['ARIMA'] = {'forecast': arima_forecast, 'rmse': rmse, 'mape': mape}
+            results['Auto-ARIMA'] = {'forecast': arima_forecast, 'rmse': rmse, 'mape': mape}
         except:
-            st.warning(f"ARIMA failed for {metric}")
-    if "ETS" in models_selected:
-        try:
-            ets_forecast = cached_forecast_ets(df[metric], horizon)
-            rmse, mape = compute_model_metrics(df[metric], ets_forecast)
-            results['ETS'] = {'forecast': ets_forecast, 'rmse': rmse, 'mape': mape}
-        except:
-            st.warning(f"ETS failed for {metric}")
+            st.warning(f"Auto-ARIMA failed for {metric}")
     if "Prophet" in models_selected:
         try:
             prophet_forecast = cached_forecast_prophet(df, time_col, metric, horizon,
