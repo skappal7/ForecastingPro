@@ -3,14 +3,23 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-import plotly.graph_objects as go
-import plotly.express as px
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 from sklearn.ensemble import IsolationForest
 from concurrent.futures import ThreadPoolExecutor
 import warnings
 import io
 import json
+
+# Handle Plotly imports with error checking
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError as e:
+    PLOTLY_AVAILABLE = False
+    st.error(f"Plotly import failed: {str(e)}")
+    st.error("Please ensure plotly is installed: pip install plotly")
+    st.stop()
 
 # Handle optional imports gracefully
 try:
