@@ -6,9 +6,9 @@ from datetime import timedelta
 import warnings
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore")
-
 st.set_page_config(page_title="Time Series Forecasting Dashboard", layout="wide")
 
 # -------------------------------
@@ -23,7 +23,6 @@ from sklearn.ensemble import IsolationForest
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 import plotly.graph_objects as go
 import plotly.express as px
-from concurrent.futures import ThreadPoolExecutor
 
 # -------------------------------
 # Custom CSS
@@ -141,6 +140,16 @@ def compute_model_metrics(series, forecast):
     mape = mean_absolute_percentage_error(series[-min_len:], forecast[-min_len:])
     return rmse, mape
 
+def generate_insights(df, metric, anomalies):
+    insights = []
+    series = df[metric]
+    if series.iloc[-1] > series.mean():
+        insights.append(f"Metric {metric} is currently above its historical average.")
+    if len(anomalies)>0:
+        for date, value in anomalies.items():
+            insights.append(f"Anomaly detected in {metric} on {date.date()} with value {value:.2f}.")
+    return insights
+
 # -------------------------------
 # Sidebar
 # -------------------------------
@@ -152,19 +161,19 @@ if uploaded_file:
     time_col_auto = detect_time_column(df)
     time_col = st.sidebar.selectbox("Select Time Column", df.columns, index=df.columns.get_loc(time_col_auto) if time_col_auto else 0)
     df = preprocess_data(df, time_col)
-    
+
     metric_options = df.select_dtypes(include=np.number).columns.tolist()
-    metrics_selected = st.sidebar.multiselect("Select Metrics", metric_options, default=metric_options[:1])
-    
+    metrics_selected = st.sidebar.multiselect("Select Metrics to Forecast", metric_options, default=metric_options[:1])
+
     horizon_dict = {}
     st.sidebar.markdown("**Forecast Horizon per Metric (days)**")
     for metric in metrics_selected:
         horizon_dict[metric] = st.sidebar.slider(f"{metric} horizon", 1, 365, 7)
-    
+
     models_selected = st.sidebar.multiselect("Select Models", ["Auto-ARIMA","NeuralProphet"], default=["Auto-ARIMA","NeuralProphet"])
 
 # -------------------------------
-# Forecasting function
+# Forecasting per metric
 # -------------------------------
 def run_forecast_for_metric(metric):
     horizon = horizon_dict[metric]
@@ -189,33 +198,45 @@ def run_forecast_for_metric(metric):
     return metric, results
 
 # -------------------------------
-# Main Panel
+# Main Panel Tabs
 # -------------------------------
 if uploaded_file:
     st.title("Time Series Forecasting Dashboard")
-    forecast_results = {}
-    loader_placeholder = st.empty()
-    with loader_placeholder.container():
-        st.markdown(loader_html, unsafe_allow_html=True)
-        st.write("Running multi-metric forecasting. Please wait...")
-        with ThreadPoolExecutor(max_workers=min(4, len(metrics_selected))) as executor:
-            futures = [executor.submit(run_forecast_for_metric, metric) for metric in metrics_selected]
-            for future in futures:
-                metric, results = future.result()
-                forecast_results[metric] = results
-    loader_placeholder.empty()
-    
-    for metric in metrics_selected:
-        st.markdown(f"### Forecast for {metric}")
-        results = forecast_results[metric]
-        metrics_df = pd.DataFrame({
-            'Model':[k for k in results.keys()],
-            'RMSE':[v['rmse'] for v in results.values()],
-            'MAPE':[v['mape'] for v in results.values()]
-        })
-        best_model = metrics_df.sort_values('RMSE').iloc[0]['Model']
-        forecast_df = results[best_model]['forecast']
-        st.write(f"**Selected Model:** {best_model}")
-        st.dataframe(metrics_df)
-        fig = plot_forecast(df, forecast_df, time_col, metric)
-        st.plotly_chart(fig, use_container_width=True)
+    tabs = st.tabs(["Data Preview","Forecasting","Anomalies","Insights","Download Results","Model Comparison"])
+
+    # --- Data Preview ---
+    with tabs[0]:
+        st.subheader("Raw Data")
+        st.dataframe(df.head())
+        st.write("Summary Statistics")
+        st.dataframe(df.describe())
+
+    # --- Forecasting ---
+    with tabs[1]:
+        st.subheader("Forecasts")
+        forecast_results = {}
+        loader_placeholder = st.empty()
+        with loader_placeholder.container():
+            st.markdown(loader_html, unsafe_allow_html=True)
+            st.write("Running multi-metric forecasting. Please wait...")
+            with ThreadPoolExecutor(max_workers=min(4, len(metrics_selected))) as executor:
+                futures = [executor.submit(run_forecast_for_metric, metric) for metric in metrics_selected]
+                for future in futures:
+                    metric, results = future.result()
+                    forecast_results[metric] = results
+        loader_placeholder.empty()
+
+        for metric in metrics_selected:
+            st.markdown(f"### Forecast for {metric}")
+            results = forecast_results[metric]
+            metrics_df = pd.DataFrame({
+                'Model':[k for k in results.keys()],
+                'RMSE':[v['rmse'] for v in results.values()],
+                'MAPE':[v['mape'] for v in results.values()]
+            })
+            best_model = metrics_df.sort_values('RMSE').iloc[0]['Model']
+            forecast_df = results[best_model]['forecast']
+            st.write(f"**Selected Model:** {best_model}")
+            st.dataframe(metrics_df)
+            fig = plot_forecast(df, forecast_df, time_col, metric)
+            st.plotly_chart(fig, use_container_width=True)
