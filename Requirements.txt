@@ -1,9 +1,8 @@
+# Core requirements (always include these)
 streamlit
 pandas
 numpy
-plotly-express
 plotly
 scikit-learn
-xlsxwriter
 openpyxl
 xlrd
