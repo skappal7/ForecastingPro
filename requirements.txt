@@ -4,7 +4,6 @@ numpy>=1.23
 plotly>=5.0
 matplotlib>=3.5
 prophet>=1.1
-pmdarima>=2.2
 statsmodels>=0.13
 scikit-learn>=1.1
 lightgbm>=3.3
