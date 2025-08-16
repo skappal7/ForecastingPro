@@ -1,595 +1,334 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta, datetime
+from datetime import timedelta
+from prophet import Prophet
+import pmdarima as pm
+from sklearn.ensemble import IsolationForest
+import plotly.graph_objects as go
+import plotly.express as px
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from concurrent.futures import ThreadPoolExecutor
 import warnings
 import io
 import json
-from concurrent.futures import ThreadPoolExecutor
-
-# Import libraries with fallbacks
-try:
-    import plotly.graph_objects as go
-    import plotly.express as px
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-    st.error("Plotly not available. Charts will be disabled.")
-
-try:
-    from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
-    from sklearn.ensemble import IsolationForest
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-    st.warning("Scikit-learn not available. Some features will be limited.")
-
-try:
-    from prophet import Prophet
-    PROPHET_AVAILABLE = True
-except ImportError:
-    PROPHET_AVAILABLE = False
-
-try:
-    import pmdarima as pm
-    PMDARIMA_AVAILABLE = True
-except ImportError:
-    PMDARIMA_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
 
-st.set_page_config(
-    page_title="Time Series Forecasting Dashboard", 
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Time Series Forecasting Dashboard", layout="wide")
 
+# -------------------------------
 # Custom CSS
+# -------------------------------
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1f2937;
-        text-align: center;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        padding: 1.5rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    .stButton > button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
-        border-radius: 8px;
-        padding: 0.75rem 1.5rem;
-        font-weight: 600;
-    }
-    .status-success {
-        color: #10b981;
-        font-weight: bold;
-    }
-    .status-error {
-        color: #ef4444;
-        font-weight: bold;
-    }
+body {background-color: #f5f5f5;}
+h1, h2, h3 {color: #1F2937;}
+.stButton>button {background-color:#4F46E5; color:white;}
+.stSidebar .sidebar-content {background-color: #E0E7FF;}
+.metric-card {background-color: white; padding: 15px; border-radius: 10px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);}
 </style>
 """, unsafe_allow_html=True)
 
-# Utility Functions
-@st.cache_data
-def load_data(uploaded_file):
-    """Load data from uploaded file"""
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        elif uploaded_file.name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(uploaded_file)
-        else:
-            st.error("Unsupported file format")
-            return None
-        return df
-    except Exception as e:
-        st.error(f"Error loading file: {str(e)}")
-        return None
+# -------------------------------
+# Animated loader HTML/CSS
+# -------------------------------
+loader_html = """
+<div style="display:flex;justify-content:center;align-items:center;height:50px;">
+  <div class="lds-ring"><div></div><div></div><div></div><div></div></div>
+</div>
+<style>
+.lds-ring {display: inline-block; position: relative; width: 40px; height: 40px;}
+.lds-ring div {box-sizing: border-box; display: block; position: absolute; width: 32px; height: 32px; margin: 4px; border: 4px solid #4F46E5; border-radius: 50%; animation: lds-ring 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite; border-color: #4F46E5 transparent transparent transparent;}
+.lds-ring div:nth-child(1) { animation-delay: -0.45s; }
+.lds-ring div:nth-child(2) { animation-delay: -0.3s; }
+.lds-ring div:nth-child(3) { animation-delay: -0.15s; }
+@keyframes lds-ring {0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); }}
+</style>
+"""
 
-def detect_datetime_column(df):
-    """Automatically detect datetime columns"""
-    datetime_cols = []
+# -------------------------------
+# Utility Functions
+# -------------------------------
+def load_data(uploaded_file):
+    if uploaded_file.name.endswith('.csv'):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+    return df
+
+def detect_time_column(df):
     for col in df.columns:
         try:
-            # Try to convert a sample of the column
-            sample = df[col].dropna().head(100)
-            pd.to_datetime(sample, errors='raise')
-            datetime_cols.append(col)
+            pd.to_datetime(df[col])
+            return col
         except:
             continue
-    return datetime_cols
+    return None
 
 def preprocess_data(df, time_col):
-    """Clean and preprocess the data"""
-    try:
-        # Convert to datetime
-        df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
-        
-        # Remove rows where datetime conversion failed
-        df = df.dropna(subset=[time_col])
-        
-        # Sort by time
-        df = df.sort_values(time_col).reset_index(drop=True)
-        
-        return df
-    except Exception as e:
-        st.error(f"Error preprocessing data: {str(e)}")
-        return df
+    df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
+    df = df.sort_values(time_col)
+    df = df.dropna(subset=[time_col])
+    return df
 
-# Simple Moving Average Forecast (fallback when other libraries fail)
-def simple_moving_average_forecast(series, window=7, periods=7):
-    """Simple moving average forecast"""
-    try:
-        if len(series) < window:
-            window = len(series)
-        
-        moving_avg = series.rolling(window=window).mean().iloc[-1]
-        forecast = [moving_avg] * periods
-        return np.array(forecast)
-    except:
-        return np.array([series.mean()] * periods)
-
-# Linear trend forecast (fallback method)
-def linear_trend_forecast(series, periods=7):
-    """Simple linear trend extrapolation"""
-    try:
-        x = np.arange(len(series))
-        y = series.values
-        
-        # Simple linear regression
-        n = len(x)
-        sum_x = np.sum(x)
-        sum_y = np.sum(y)
-        sum_xy = np.sum(x * y)
-        sum_xx = np.sum(x * x)
-        
-        slope = (n * sum_xy - sum_x * sum_y) / (n * sum_xx - sum_x * sum_x)
-        intercept = (sum_y - slope * sum_x) / n
-        
-        # Generate forecast
-        future_x = np.arange(len(series), len(series) + periods)
-        forecast = slope * future_x + intercept
-        
-        return forecast
-    except:
-        return np.array([series.mean()] * periods)
-
-# Anomaly detection with simple statistical method
-def detect_anomalies_simple(series, threshold=3):
-    """Detect anomalies using z-score method"""
-    try:
-        z_scores = np.abs((series - series.mean()) / series.std())
-        anomalies = series[z_scores > threshold]
-        return anomalies
-    except:
-        return pd.Series(dtype=float)
-
-def detect_anomalies_iqr(series):
-    """Detect anomalies using IQR method"""
-    try:
-        Q1 = series.quantile(0.25)
-        Q3 = series.quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-        anomalies = series[(series < lower_bound) | (series > upper_bound)]
-        return anomalies
-    except:
-        return pd.Series(dtype=float)
-
-# Advanced forecasting methods (when libraries are available)
+# -------------------------------
+# Forecasting functions with caching
+# -------------------------------
 @st.cache_data(show_spinner=False)
-def prophet_forecast(df, time_col, value_col, periods):
-    """Prophet forecasting method"""
-    if not PROPHET_AVAILABLE:
-        return None
-    
-    try:
-        # Prepare data for Prophet
-        prophet_df = df[[time_col, value_col]].rename(columns={time_col: 'ds', value_col: 'y'})
-        prophet_df = prophet_df.dropna()
-        
-        # Initialize and fit model
-        model = Prophet(
-            daily_seasonality=False,
-            weekly_seasonality=True,
-            yearly_seasonality=True,
-            interval_width=0.95
-        )
-        model.fit(prophet_df)
-        
-        # Make future predictions
-        future = model.make_future_dataframe(periods=periods)
-        forecast = model.predict(future)
-        
-        return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
-    except Exception as e:
-        st.warning(f"Prophet forecasting failed: {str(e)}")
-        return None
+def cached_forecast_auto_arima(series, steps):
+    model = pm.auto_arima(series, seasonal=False, stepwise=True, suppress_warnings=True)
+    forecast = model.predict(n_periods=steps)
+    return forecast
 
 @st.cache_data(show_spinner=False)
-def arima_forecast(series, periods):
-    """ARIMA forecasting method"""
-    if not PMDARIMA_AVAILABLE:
-        return None
-    
-    try:
-        model = pm.auto_arima(
-            series,
-            start_p=1, start_q=1,
-            max_p=3, max_q=3,
-            seasonal=False,
-            stepwise=True,
-            suppress_warnings=True,
-            error_action='ignore'
-        )
-        forecast = model.predict(n_periods=periods)
-        return forecast
-    except Exception as e:
-        st.warning(f"ARIMA forecasting failed: {str(e)}")
-        return None
+def cached_forecast_prophet(df, time_col, value_col, periods, holidays=None, custom_seasonality=None):
+    df_prophet = df[[time_col, value_col]].rename(columns={time_col:'ds', value_col:'y'})
+    model = Prophet(holidays=holidays)
+    if custom_seasonality:
+        for season in custom_seasonality:
+            model.add_seasonality(name=season['name'], period=season['period'], fourier_order=season['fourier_order'])
+    model.fit(df_prophet)
+    future = model.make_future_dataframe(periods=periods)
+    forecast = model.predict(future)
+    return forecast[['ds','yhat','yhat_lower','yhat_upper']]
 
-# Plotting functions
-def create_basic_plot(df, time_col, value_col, forecast_data=None, anomalies=None, title="Time Series"):
-    """Create basic plot using Plotly or fallback to line chart"""
-    if PLOTLY_AVAILABLE:
-        fig = go.Figure()
-        
-        # Add actual data
-        fig.add_trace(go.Scatter(
-            x=df[time_col],
-            y=df[value_col],
-            mode='lines',
-            name='Actual',
-            line=dict(color='blue')
-        ))
-        
-        # Add forecast if available
-        if forecast_data is not None:
-            if isinstance(forecast_data, pd.DataFrame) and 'ds' in forecast_data.columns:
-                # Prophet forecast
-                fig.add_trace(go.Scatter(
-                    x=forecast_data['ds'],
-                    y=forecast_data['yhat'],
-                    mode='lines',
-                    name='Forecast',
-                    line=dict(color='red', dash='dash')
-                ))
-                
-                # Add confidence intervals
-                fig.add_trace(go.Scatter(
-                    x=forecast_data['ds'],
-                    y=forecast_data['yhat_upper'],
-                    mode='lines',
-                    name='Upper Bound',
-                    line=dict(color='lightcoral', dash='dot'),
-                    showlegend=False
-                ))
-                fig.add_trace(go.Scatter(
-                    x=forecast_data['ds'],
-                    y=forecast_data['yhat_lower'],
-                    mode='lines',
-                    name='Lower Bound',
-                    line=dict(color='lightcoral', dash='dot'),
-                    fill='tonexty',
-                    fillcolor='rgba(255,182,193,0.2)',
-                    showlegend=False
-                ))
-            else:
-                # Simple forecast (array)
-                last_date = df[time_col].iloc[-1]
-                future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=len(forecast_data))
-                fig.add_trace(go.Scatter(
-                    x=future_dates,
-                    y=forecast_data,
-                    mode='lines',
-                    name='Forecast',
-                    line=dict(color='red', dash='dash')
-                ))
-        
-        # Add anomalies if available
-        if anomalies is not None and len(anomalies) > 0:
-            anomaly_dates = df.loc[anomalies.index, time_col]
-            fig.add_trace(go.Scatter(
-                x=anomaly_dates,
-                y=anomalies.values,
-                mode='markers',
-                name='Anomalies',
-                marker=dict(color='red', size=8, symbol='x')
-            ))
-        
-        fig.update_layout(
-            title=title,
-            xaxis_title='Date',
-            yaxis_title='Value',
-            hovermode='x unified',
-            showlegend=True
-        )
-        
-        return fig
+# -------------------------------
+# Anomaly detection
+# -------------------------------
+def detect_anomalies_stat(series):
+    mean = series.mean()
+    std = series.std()
+    z_score = (series - mean)/std
+    return series[np.abs(z_score) > 3]
+
+def detect_anomalies_iforest(series):
+    clf = IsolationForest(contamination=0.05, random_state=42)
+    data = series.values.reshape(-1,1)
+    clf.fit(data)
+    pred = clf.predict(data)
+    return series[pred==-1]
+
+# -------------------------------
+# Insights & plotting
+# -------------------------------
+def generate_insights(df, metric, anomalies):
+    insights = []
+    series = df[metric]
+    if series.iloc[-1] > series.mean():
+        insights.append(f"Metric {metric} is currently above its historical average.")
+    if len(anomalies)>0:
+        for date, value in anomalies.items():
+            insights.append(f"Anomaly detected in {metric} on {date.date()} with value {value:.2f}.")
+    return insights
+
+def compute_model_metrics(series, forecast):
+    min_len = min(len(series), len(forecast))
+    rmse = mean_squared_error(series[-min_len:], forecast[-min_len:], squared=False)
+    mape = mean_absolute_percentage_error(series[-min_len:], forecast[-min_len:])
+    return rmse, mape
+
+def plot_forecast(df, forecast_df, time_col, metric):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df[time_col], y=df[metric], mode='lines', name='Actual'))
+    if 'yhat' in forecast_df.columns:
+        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat'], mode='lines', name='Forecast'))
+        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat_upper'], mode='lines', name='Upper', line=dict(dash='dash')))
+        fig.add_trace(go.Scatter(x=forecast_df['ds'], y=forecast_df['yhat_lower'], mode='lines', name='Lower', line=dict(dash='dash')))
     else:
-        # Fallback to Streamlit line chart
-        chart_data = df.set_index(time_col)[value_col]
-        return chart_data
+        fig.add_trace(go.Scatter(x=forecast_df.index, y=forecast_df, mode='lines', name='Forecast'))
+    fig.update_layout(title=f"Forecast for {metric}", xaxis_title=time_col, yaxis_title=metric)
+    return fig
 
-# Main Application
-def main():
-    st.markdown('<h1 class="main-header">📈 Time Series Forecasting Dashboard</h1>', unsafe_allow_html=True)
-    
-    # Show library status
-    with st.expander("📋 Library Status", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Core Libraries:**")
-            st.markdown(f"• Pandas: ✅")
-            st.markdown(f"• NumPy: ✅")
-            st.markdown(f"• Plotly: {'✅' if PLOTLY_AVAILABLE else '❌'}")
-            
-        with col2:
-            st.markdown("**ML Libraries:**")
-            st.markdown(f"• Scikit-learn: {'✅' if SKLEARN_AVAILABLE else '❌'}")
-            st.markdown(f"• Prophet: {'✅' if PROPHET_AVAILABLE else '❌'}")
-            st.markdown(f"• pmdarima: {'✅' if PMDARIMA_AVAILABLE else '❌'}")
-    
-    # Sidebar
-    st.sidebar.title("🔧 Configuration")
-    
-    # File upload
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload your time series data",
-        type=['csv', 'xlsx', 'xls'],
-        help="Upload a CSV or Excel file with time series data"
-    )
-    
-    if uploaded_file is None:
-        st.info("👆 Please upload a CSV or Excel file to get started!")
-        
-        # Show example data format
-        st.subheader("📊 Expected Data Format")
-        example_data = pd.DataFrame({
-            'date': pd.date_range('2023-01-01', periods=100, freq='D'),
-            'sales': np.random.normal(1000, 100, 100) + np.sin(np.arange(100) * 0.1) * 50,
-            'revenue': np.random.normal(5000, 500, 100) + np.cos(np.arange(100) * 0.1) * 200
-        })
-        st.dataframe(example_data.head(10))
-        
-        # Download example data
-        csv = example_data.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Example Data",
-            data=csv,
-            file_name="example_timeseries_data.csv",
-            mime="text/csv"
-        )
-        return
-    
-    # Load data
-    with st.spinner("Loading data..."):
-        df = load_data(uploaded_file)
-    
-    if df is None:
-        return
-    
-    st.success(f"✅ Data loaded successfully! Shape: {df.shape}")
-    
-    # Detect datetime columns
-    datetime_cols = detect_datetime_column(df)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    
-    if not datetime_cols:
-        st.error("❌ No datetime columns detected in your data!")
-        st.stop()
-    
-    if not numeric_cols:
-        st.error("❌ No numeric columns detected in your data!")
-        st.stop()
-    
-    # Column selection
-    time_col = st.sidebar.selectbox("📅 Select Time Column", datetime_cols)
-    metrics = st.sidebar.multiselect("📊 Select Metrics to Analyze", numeric_cols, default=numeric_cols[:3])
-    
-    if not metrics:
-        st.warning("⚠️ Please select at least one metric to analyze!")
-        return
-    
-    # Preprocess data
+def plot_anomalies(df, time_col, metric, anomalies):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df[time_col], y=df[metric], mode='lines', name='Actual'))
+    if len(anomalies)>0:
+        fig.add_trace(go.Scatter(x=anomalies.index, y=anomalies.values, mode='markers', name='Anomalies', marker=dict(color='red', size=10)))
+    fig.update_layout(title=f"Anomalies in {metric}", xaxis_title=time_col, yaxis_title=metric)
+    return fig
+
+# -------------------------------
+# Sidebar controls
+# -------------------------------
+st.sidebar.title("Controls")
+uploaded_file = st.sidebar.file_uploader("Upload CSV or Excel", type=["csv","xlsx"])
+
+if uploaded_file:
+    df = load_data(uploaded_file)
+    time_col_auto = detect_time_column(df)
+    time_col = st.sidebar.selectbox("Select Time Column", df.columns, index=df.columns.get_loc(time_col_auto) if time_col_auto else 0)
     df = preprocess_data(df, time_col)
-    
-    # Forecast settings
-    st.sidebar.subheader("🔮 Forecast Settings")
-    forecast_days = st.sidebar.slider("Forecast Period (days)", 1, 90, 14)
-    
-    # Available methods
-    available_methods = ["Moving Average", "Linear Trend"]
-    if PROPHET_AVAILABLE:
-        available_methods.append("Prophet")
-    if PMDARIMA_AVAILABLE:
-        available_methods.append("ARIMA")
-    
-    forecast_method = st.sidebar.selectbox("Forecasting Method", available_methods)
-    
-    # Main content tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Data Overview", "🔮 Forecasting", "🚨 Anomaly Detection", "📈 Advanced Analysis"])
-    
-    with tab1:
-        st.subheader("📊 Data Overview")
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.write("**Data Preview:**")
-            st.dataframe(df.head(10))
-            
-        with col2:
-            st.write("**Data Summary:**")
-            st.write(f"• Total Records: {len(df):,}")
-            st.write(f"• Date Range: {df[time_col].min().date()} to {df[time_col].max().date()}")
-            st.write(f"• Metrics: {len(metrics)}")
-        
-        # Basic statistics
-        st.write("**Statistical Summary:**")
-        st.dataframe(df[metrics].describe())
-        
-        # Plot selected metrics
-        for metric in metrics:
-            if PLOTLY_AVAILABLE:
-                fig = create_basic_plot(df, time_col, metric, title=f"Time Series: {metric}")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                chart_data = df.set_index(time_col)[metric]
-                st.line_chart(chart_data)
-    
-    with tab2:
-        st.subheader("🔮 Forecasting Results")
-        
-        for metric in metrics:
-            st.write(f"**Forecasting: {metric}**")
-            
-            series = df[metric].dropna()
-            
-            # Generate forecast based on selected method
-            forecast_result = None
-            
-            if forecast_method == "Moving Average":
-                forecast_result = simple_moving_average_forecast(series, periods=forecast_days)
-            elif forecast_method == "Linear Trend":
-                forecast_result = linear_trend_forecast(series, periods=forecast_days)
-            elif forecast_method == "Prophet" and PROPHET_AVAILABLE:
-                forecast_result = prophet_forecast(df, time_col, metric, forecast_days)
-            elif forecast_method == "ARIMA" and PMDARIMA_AVAILABLE:
-                forecast_result = arima_forecast(series, forecast_days)
-            
-            if forecast_result is not None:
-                # Plot forecast
-                if PLOTLY_AVAILABLE:
-                    fig = create_basic_plot(df, time_col, metric, forecast_result, title=f"Forecast: {metric} ({forecast_method})")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    chart_data = df.set_index(time_col)[metric]
-                    st.line_chart(chart_data)
-                    st.write("Forecast values:", forecast_result if isinstance(forecast_result, (list, np.ndarray)) else "Complex forecast data")
-                
-                # Show forecast summary
-                current_value = series.iloc[-1]
-                if isinstance(forecast_result, pd.DataFrame) and 'yhat' in forecast_result.columns:
-                    predicted_value = forecast_result['yhat'].iloc[-1]
-                elif isinstance(forecast_result, (list, np.ndarray)):
-                    predicted_value = forecast_result[-1]
-                else:
-                    predicted_value = current_value
-                
-                change_pct = ((predicted_value - current_value) / current_value) * 100
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Current Value", f"{current_value:.2f}")
-                with col2:
-                    st.metric("Predicted Value", f"{predicted_value:.2f}", f"{change_pct:.1f}%")
-                with col3:
-                    st.metric("Forecast Period", f"{forecast_days} days")
-            
-            st.markdown("---")
-    
-    with tab3:
-        st.subheader("🚨 Anomaly Detection")
-        
-        for metric in metrics:
-            st.write(f"**Anomalies in: {metric}**")
-            
-            series = df[metric].dropna()
-            
-            # Detect anomalies using multiple methods
-            anomalies_zscore = detect_anomalies_simple(series, threshold=3)
-            anomalies_iqr = detect_anomalies_iqr(series)
-            
-            # Combine anomalies
-            all_anomalies = pd.concat([anomalies_zscore, anomalies_iqr]).drop_duplicates()
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Z-Score Anomalies", len(anomalies_zscore))
-            with col2:
-                st.metric("IQR Anomalies", len(anomalies_iqr))
-            
-            if len(all_anomalies) > 0:
-                if PLOTLY_AVAILABLE:
-                    fig = create_basic_plot(df, time_col, metric, anomalies=all_anomalies, title=f"Anomalies: {metric}")
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    chart_data = df.set_index(time_col)[metric]
-                    st.line_chart(chart_data)
-                
-                # Show anomaly details
-                anomaly_details = df.loc[all_anomalies.index, [time_col, metric]]
-                st.write("**Anomaly Details:**")
-                st.dataframe(anomaly_details)
-            else:
-                st.info("No anomalies detected in this metric.")
-            
-            st.markdown("---")
-    
-    with tab4:
-        st.subheader("📈 Advanced Analysis")
-        
-        # Correlation matrix
-        if len(metrics) > 1:
-            st.write("**Correlation Matrix:**")
-            corr_matrix = df[metrics].corr()
-            
-            if PLOTLY_AVAILABLE:
-                fig = px.imshow(
-                    corr_matrix,
-                    text_auto=True,
-                    aspect="auto",
-                    title="Metric Correlations"
-                )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.dataframe(corr_matrix)
-        
-        # Trend analysis
-        st.write("**Trend Analysis:**")
-        for metric in metrics:
-            series = df[metric].dropna()
-            
-            # Calculate basic trend metrics
-            first_half = series[:len(series)//2].mean()
-            second_half = series[len(series)//2:].mean()
-            trend_direction = "↗️ Increasing" if second_half > first_half else "↘️ Decreasing"
-            trend_magnitude = abs((second_half - first_half) / first_half * 100)
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric(f"{metric} Trend", trend_direction)
-            with col2:
-                st.metric("Trend Magnitude", f"{trend_magnitude:.1f}%")
-            with col3:
-                st.metric("Volatility (CV)", f"{(series.std()/series.mean()*100):.1f}%")
-        
-        # Data export
-        st.subheader("📥 Export Data")
-        
-        # Prepare export data
-        export_data = df.copy()
-        
-        csv = export_data.to_csv(index=False)
-        st.download_button(
-            label="📊 Download Processed Data (CSV)",
-            data=csv,
-            file_name=f"processed_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
 
-if __name__ == "__main__":
-    main()
+    metric_options = df.select_dtypes(include=np.number).columns.tolist()
+    metrics_selected = st.sidebar.multiselect("Select Metrics to Forecast", metric_options, default=metric_options[:1])
+
+    # ------------------ Interactive Horizon ------------------
+    horizon_dict = {}
+    st.sidebar.markdown("**Forecast Horizon per Metric (days)**")
+    for metric in metrics_selected:
+        horizon_dict[metric] = st.sidebar.slider(f"{metric} horizon", min_value=1, max_value=365, value=7)
+
+    models_selected = st.sidebar.multiselect("Select Models", ["Auto-ARIMA","Prophet"], default=["Auto-ARIMA","Prophet"])
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Optional:** Upload holidays CSV with column 'ds' for Prophet")
+    holiday_file = st.sidebar.file_uploader("Upload Holidays CSV", type=["csv"])
+    holidays_df = None
+    if holiday_file:
+        holidays_df = pd.read_csv(holiday_file)
+        if 'ds' in holidays_df.columns:
+            holidays_df['ds'] = pd.to_datetime(holidays_df['ds'])
+        else:
+            st.sidebar.warning("Holiday file must have a 'ds' column")
+
+    st.sidebar.markdown("**Optional:** Add custom seasonalities for Prophet")
+    custom_seasonality_input = st.sidebar.text_area("Enter as JSON list e.g., [{'name':'monthly','period':30.5,'fourier_order':5}]", "")
+    custom_seasonality = None
+    if custom_seasonality_input:
+        try:
+            custom_seasonality = json.loads(custom_seasonality_input)
+        except:
+            st.sidebar.warning("Invalid JSON format for custom seasonalities")
+
+# -------------------------------
+# Forecasting function for threading
+# -------------------------------
+def run_forecast_for_metric(metric):
+    horizon = horizon_dict[metric]
+    results = {}
+    if "Auto-ARIMA" in models_selected:
+        try:
+            arima_forecast = cached_forecast_auto_arima(df[metric], horizon)
+            rmse, mape = compute_model_metrics(df[metric], arima_forecast)
+            results['Auto-ARIMA'] = {'forecast': arima_forecast, 'rmse': rmse, 'mape': mape}
+        except:
+            st.warning(f"Auto-ARIMA failed for {metric}")
+    if "Prophet" in models_selected:
+        try:
+            prophet_forecast = cached_forecast_prophet(df, time_col, metric, horizon,
+                                                        holidays=holidays_df,
+                                                        custom_seasonality=custom_seasonality)
+            y_true = df[metric].values[-horizon:]
+            y_pred = prophet_forecast['yhat'].values[-horizon:]
+            rmse = mean_squared_error(y_true, y_pred, squared=False)
+            mape = mean_absolute_percentage_error(y_true, y_pred)
+            results['Prophet'] = {'forecast': prophet_forecast, 'rmse': rmse, 'mape': mape}
+        except:
+            st.warning(f"Prophet failed for {metric}")
+    return metric, results
+
+# -------------------------------
+# Main Panel
+# -------------------------------
+if uploaded_file:
+    st.title("Time Series Forecasting Dashboard")
+    tabs = st.tabs(["Data Preview","Forecasting","Anomalies","Insights","Download Results","Model Comparison"])
+
+    # --- Data Preview ---
+    with tabs[0]:
+        st.subheader("Raw Data")
+        st.dataframe(df.head())
+        st.write("Summary Statistics")
+        st.dataframe(df.describe())
+
+    # --- Forecasting ---
+    with tabs[1]:
+        st.subheader("Forecasts")
+        forecast_results = {}
+        loader_placeholder = st.empty()
+        with loader_placeholder.container():
+            st.markdown(loader_html, unsafe_allow_html=True)
+            st.write("Running multi-metric forecasting. Please wait...")
+            with ThreadPoolExecutor(max_workers=min(4, len(metrics_selected))) as executor:
+                futures = [executor.submit(run_forecast_for_metric, metric) for metric in metrics_selected]
+                for future in futures:
+                    metric, results = future.result()
+                    forecast_results[metric] = results
+        loader_placeholder.empty()
+
+        for metric in metrics_selected:
+            st.markdown(f"### Forecast for {metric}")
+            results = forecast_results[metric]
+            metrics_df = pd.DataFrame({
+                'Model': [k for k in results.keys()],
+                'RMSE': [v['rmse'] for v in results.values()],
+                'MAPE': [v['mape'] for v in results.values()]
+            })
+            best_model = metrics_df.sort_values('RMSE').iloc[0]['Model']
+            forecast_df = results[best_model]['forecast']
+            st.write(f"**Selected Model:** {best_model}")
+            st.dataframe(metrics_df)
+            fig = plot_forecast(df, forecast_df, time_col, metric)
+            st.plotly_chart(fig, use_container_width=True)
+
+            if 'yhat' in forecast_df.columns:
+                forecast_value = forecast_df['yhat'].iloc[-1]
+            else:
+                forecast_value = forecast_df.iloc[-1]
+            current_value = df[metric].iloc[-1]
+            st.markdown(f"""
+                <div class="metric-card">
+                    <h4>{metric} Forecast</h4>
+                    <p>Current Value: {current_value:.2f}</p>
+                    <p>Forecasted Value: {forecast_value:.2f}</p>
+                </div>
+            """, unsafe_allow_html=True)
+
+    # --- Anomalies ---
+    with tabs[2]:
+        st.subheader("Anomaly Detection")
+        anomalies_all = {}
+        for metric in metrics_selected:
+            st.markdown(f"### Anomalies in {metric}")
+            anomalies_stat = detect_anomalies_stat(df[metric])
+            anomalies_if = detect_anomalies_iforest(df[metric])
+            anomalies_combined = pd.concat([anomalies_stat, anomalies_if]).drop_duplicates()
+            anomalies_all[metric] = anomalies_combined
+            fig_anom = plot_anomalies(df, time_col, metric, anomalies_combined)
+            st.plotly_chart(fig_anom, use_container_width=True)
+            st.write(f"Detected {len(anomalies_combined)} anomalies.")
+
+    # --- Insights ---
+    with tabs[3]:
+        st.subheader("Auto-generated Insights")
+        for metric in metrics_selected:
+            anomalies_combined = anomalies_all.get(metric, pd.Series())
+            insights = generate_insights(df, metric, anomalies_combined)
+            st.markdown(f"### Insights for {metric}")
+            for ins in insights:
+                st.write("- " + ins)
+
+    # --- Download Results ---
+    with tabs[4]:
+        st.subheader("Download Forecast Results")
+        for metric in metrics_selected:
+            results = forecast_results[metric]
+            best_model = pd.DataFrame({
+                'Model': [k for k in results.keys()],
+                'RMSE': [v['rmse'] for v in results.values()],
+                'MAPE': [v['mape'] for v in results.values()]
+            }).sort_values('RMSE').iloc[0]['Model']
+            forecast_df = results[best_model]['forecast']
+            st.markdown(f"**{metric} - {best_model} Forecast**")
+            csv = forecast_df.to_csv(index=False).encode()
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+                forecast_df.to_excel(writer, sheet_name=f'{metric}_Forecast', index=False)
+            st.download_button(label=f"Download {metric} CSV", data=csv, file_name=f"{metric}_forecast.csv", mime='text/csv')
+            st.download_button(label=f"Download {metric} Excel", data=excel_buffer, file_name=f"{metric}_forecast.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+    # --- Model Comparison ---
+    with tabs[5]:
+        st.subheader("Model Comparison (RMSE / MAPE)")
+        comparison_rows = []
+        for metric in metrics_selected:
+            results = forecast_results[metric]
+            for model_name, metrics in results.items():
+                comparison_rows.append({'Metric': metric, 'Model': model_name, 'RMSE': metrics['rmse'], 'MAPE': metrics['mape']})
+        comparison_df = pd.DataFrame(comparison_rows)
+        fig_rmse = px.bar(comparison_df, x='Metric', y='RMSE', color='Model', barmode='group', title="RMSE Comparison")
+        fig_mape = px.bar(comparison_df, x='Metric', y='MAPE', color='Model', barmode='group', title="MAPE Comparison")
+        st.plotly_chart(fig_rmse, use_container_width=True)
+        st.plotly_chart(fig_mape, use_container_width=True)
