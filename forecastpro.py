@@ -545,7 +545,7 @@ def main():
                     try:
                         if mc == 'Prophet' and Prophet is not None:
                             m, fcst = forecast_with_prophet(working_df, date_col, value_col, comp_periods, user_freq, 'additive', True, False, False)
-                            out = fcst[['ds','yhat']].rename(columns={'yhat':'y'})\                            
+                            out = fcst[['ds','yhat']].rename(columns={'yhat':'y'})
                             results[mc] = out
                             # metrics
                             def p_predict(train, h):
