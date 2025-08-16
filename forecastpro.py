@@ -2,18 +2,15 @@
 Forecasting Pro
 No Code Forecasting App
 
-Single-file Streamlit app. Updated: removed pmdarima; added SARIMAX/full ARIMA via statsmodels + Holt-Winters (ExponentialSmoothing). Improved anomaly detection with interpretability and interactive tooltips showing categorical context and narrative. Model comparison includes table of accuracy metrics (MAE, RMSE, MAPE).
+Single-file Streamlit app.
+
+Fixes in this version:
+- Removed use of `squared=` parameter (some sklearn versions don't accept it). RMSE is computed as sqrt of MSE.
+- Fixed boolean indexing mismatch by aligning/reindexing context and anomaly mask to the same index before using them.
+- Hardened Holt-Winters: detect insufficient seasonal cycles and fall back to non-seasonal or smaller seasonal_periods; catch errors and provide fallback forecast.
+- General robustness: safer joins, clearer error messages, no stray backslashes.
 
 Footer: Developed with ❤️Streamlit CE Innovation Labs 2025
-
-This app supports:
-- Prophet (for seasonality/holidays)
-- SARIMAX (statsmodels) for ARIMA/SARIMA
-- Holt-Winters (ExponentialSmoothing) for triple exponential smoothing
-- Gradient Boosting (scikit-learn)
-- Anomaly detection using IsolationForest with narrative explanations and interactive Plotly tooltips
-
-
 """
 
 import streamlit as st
@@ -93,10 +90,12 @@ def download_df(df: pd.DataFrame, filename: str):
 
 
 def forecast_with_prophet(df, date_col, value_col, periods, freq, seasonality_mode, yearly_seasonality, weekly_seasonality, daily_seasonality, holidays_df=None):
-    m = Prophet(seasonality_mode=seasonality_mode,
-                yearly_seasonality=yearly_seasonality,
-                weekly_seasonality=weekly_seasonality,
-                daily_seasonality=daily_seasonality)
+    m = Prophet(
+        seasonality_mode=seasonality_mode,
+        yearly_seasonality=yearly_seasonality,
+        weekly_seasonality=weekly_seasonality,
+        daily_seasonality=daily_seasonality,
+    )
     if holidays_df is not None and not holidays_df.empty:
         m.holidays = holidays_df
     hist = df.rename(columns={date_col: 'ds', value_col: 'y'})[['ds', 'y']]
@@ -107,19 +106,32 @@ def forecast_with_prophet(df, date_col, value_col, periods, freq, seasonality_mo
 
 
 def sarimax_forecast(df, date_col, value_col, periods, freq, order=(1,0,0), seasonal_order=(0,0,0,0)):
+    # Ensure a proper frequency-indexed series
     series = df.set_index(date_col)[value_col].asfreq(freq).fillna(method='ffill')
-    model = sm.tsa.statespace.SARIMAX(series, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
+    model = sm.tsa.statespace.SARIMAX(
+        series,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
     res = model.fit(disp=False)
     pred = res.get_forecast(steps=periods)
     idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
-    fcst = pd.DataFrame({'ds': idx, 'yhat': pred.predicted_mean, 'yhat_lower': pred.conf_int().iloc[:,0], 'yhat_upper': pred.conf_int().iloc[:,1]})
+    fcst = pd.DataFrame({
+        'ds': idx,
+        'yhat': pred.predicted_mean,
+        'yhat_lower': pred.conf_int().iloc[:, 0],
+        'yhat_upper': pred.conf_int().iloc[:, 1],
+    })
     return res, fcst
 
 
 def holt_winters_forecast(df, date_col, value_col, periods, freq, seasonal='add', seasonal_periods=None):
     series = df.set_index(date_col)[value_col].asfreq(freq).fillna(method='ffill')
+    n = len(series)
+    # sensible default if not provided
     if seasonal_periods is None:
-        # guess seasonal period: 12 for monthly, 7 for daily weekly patterns may vary
         if freq == 'M':
             seasonal_periods = 12
         elif freq == 'D':
@@ -128,17 +140,51 @@ def holt_winters_forecast(df, date_col, value_col, periods, freq, seasonal='add'
             seasonal_periods = 52
         else:
             seasonal_periods = 12
-    model = ExponentialSmoothing(series, trend='add', seasonal=seasonal, seasonal_periods=seasonal_periods)
-    res = model.fit(optimized=True)
-    fcst = res.forecast(steps=periods)
-    idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
-    fcst_df = pd.DataFrame({'ds': idx, 'yhat': fcst.values})
-    return res, fcst_df
+    # if not enough cycles for seasonal, fallback
+    if n < 2 * seasonal_periods:
+        st.warning(
+            f"Series length {n} is less than two seasonal cycles ({2 * seasonal_periods}). Falling back to non-seasonal fit."
+        )
+        # fit without seasonal component
+        try:
+            model = ExponentialSmoothing(series, trend='add', seasonal=None)
+            res = model.fit(optimized=True)
+            fcst = res.forecast(steps=periods)
+            idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
+            fcst_df = pd.DataFrame({'ds': idx, 'yhat': fcst.values})
+            return res, fcst_df
+        except Exception:
+            # final fallback: persistence
+            idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
+            fcst_df = pd.DataFrame({'ds': idx, 'yhat': np.repeat(series.iloc[-1], periods)})
+            return None, fcst_df
+    # else attempt seasonal fit
+    try:
+        model = ExponentialSmoothing(series, trend='add', seasonal=seasonal, seasonal_periods=seasonal_periods)
+        res = model.fit(optimized=True)
+        fcst = res.forecast(steps=periods)
+        idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
+        fcst_df = pd.DataFrame({'ds': idx, 'yhat': fcst.values})
+        return res, fcst_df
+    except Exception as e:
+        # fallback to non-seasonal or persistence
+        st.warning(f"Holt-Winters seasonal fit failed: {e}. Falling back to non-seasonal fit.")
+        try:
+            model = ExponentialSmoothing(series, trend='add', seasonal=None)
+            res = model.fit(optimized=True)
+            fcst = res.forecast(steps=periods)
+            idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
+            fcst_df = pd.DataFrame({'ds': idx, 'yhat': fcst.values})
+            return res, fcst_df
+        except Exception:
+            idx = pd.date_range(start=series.index[-1] + pd.tseries.frequencies.to_offset(freq), periods=periods, freq=freq)
+            fcst_df = pd.DataFrame({'ds': idx, 'yhat': np.repeat(series.iloc[-1], periods)})
+            return None, fcst_df
 
 
 def create_lag_features(series, lags=24):
     df = pd.DataFrame({'y': series})
-    for lag in range(1, lags+1):
+    for lag in range(1, lags + 1):
         df[f'lag_{lag}'] = df['y'].shift(lag)
     df = df.dropna()
     return df
@@ -152,7 +198,6 @@ def ml_forecast_with_gb(df, date_col, value_col, periods, freq, exog_cols=None, 
     X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2, shuffle=False)
     model = GradientBoostingRegressor(n_estimators=200)
     model.fit(X_train, y_train)
-    # iterative forecasting
     last_values = s.iloc[-lags:].tolist()
     preds = []
     for _ in range(periods):
@@ -168,7 +213,7 @@ def ml_forecast_with_gb(df, date_col, value_col, periods, freq, exog_cols=None, 
 
 def detect_anomalies(series, contamination=0.01):
     iso = IsolationForest(contamination=contamination, random_state=42)
-    X = series.values.reshape(-1,1)
+    X = series.values.reshape(-1, 1)
     iso.fit(X)
     scores = iso.decision_function(X)
     preds = iso.predict(X)
@@ -177,36 +222,47 @@ def detect_anomalies(series, contamination=0.01):
 
 
 def explain_anomalies(df, anomaly_mask, categorical_cols, top_n=3):
+    # Ensure mask aligns to df index
+    if isinstance(anomaly_mask, pd.Series):
+        mask = anomaly_mask.reindex(df.index, fill_value=False)
+    else:
+        # if it's an array-like convert
+        mask = pd.Series(anomaly_mask, index=df.index)
+    anomalies = df[mask.astype(bool)]
+    baseline = df[~mask.astype(bool)]
     explanations = []
-    anomalies = df[anomaly_mask]
-    baseline = df[~anomaly_mask]
-    total_anom = anomalies.shape[0]
+    if anomalies.empty:
+        return explanations
     for col in categorical_cols:
-        if col not in df.columns: continue
+        if col not in df.columns:
+            continue
         try:
             anom_counts = anomalies[col].value_counts(normalize=True).head(top_n)
             base_counts = baseline[col].value_counts(normalize=True).head(top_n)
             narrative = []
-            for k,v in anom_counts.items():
+            for k, v in anom_counts.items():
                 base_v = base_counts.get(k, 0)
                 if v > base_v:
                     pct = (v - base_v) * 100
                     narrative.append(f"Category '{k}' appears {pct:.1f}% more frequently during anomalies")
                 else:
                     narrative.append(f"Category '{k}' is not unusually frequent during anomalies")
-            explanations.append({'col':col, 'top_anom':anom_counts.to_dict(), 'top_base':base_counts.to_dict(), 'narrative': narrative})
+            explanations.append({
+                'col': col,
+                'top_anom': anom_counts.to_dict(),
+                'top_base': base_counts.to_dict(),
+                'narrative': narrative,
+            })
         except Exception:
             continue
     return explanations
 
 
 def create_anomaly_tooltip(row, categorical_cols, explanations_map):
-    # Build a tooltip string showing categorical values and a short narrative
     parts = []
     for c in categorical_cols:
         if c in row and pd.notna(row[c]):
             parts.append(f"{c}: {row[c]}")
-    # include any explanation narrative for this row's categories
     narratives = []
     for col in categorical_cols:
         val = row.get(col)
@@ -222,7 +278,6 @@ def create_anomaly_tooltip(row, categorical_cols, explanations_map):
 
 
 def compute_holdout_metrics(series, model_name, predict_func, freq, test_frac=0.2):
-    # predict_func(train_series, h) -> pd.Series indexed by datetime with length h
     n = len(series)
     if n < 10:
         return None
@@ -231,12 +286,13 @@ def compute_holdout_metrics(series, model_name, predict_func, freq, test_frac=0.
     test = series.iloc[cutoff:]
     try:
         pred_series = predict_func(train, len(test))
-        # align indices if needed
         pred_series = pd.Series(pred_series.values, index=test.index)
         from sklearn.metrics import mean_absolute_error, mean_squared_error
         mae = mean_absolute_error(test, pred_series)
-        rmse = mean_squared_error(test, pred_series, squared=False)
-        mape = (np.mean(np.abs((test - pred_series) / (test.replace(0, np.nan)))))*100
+        rmse = float(np.sqrt(mean_squared_error(test, pred_series)))
+        # MAPE: avoid division by zero
+        denom = test.replace(0, np.nan)
+        mape = float(np.nanmean(np.abs((test - pred_series) / denom))) * 100
         return {'model': model_name, 'MAE': mae, 'RMSE': rmse, 'MAPE': mape}
     except Exception as e:
         return {'model': model_name, 'error': str(e)}
@@ -253,11 +309,10 @@ def sidebar_file_upload():
 
 def format_metrics_table(metrics_list):
     df = pd.DataFrame(metrics_list)
-    # ensure columns
-    for c in ['MAE','RMSE','MAPE']:
+    for c in ['MAE', 'RMSE', 'MAPE']:
         if c not in df.columns:
             df[c] = np.nan
-    return df[['model','MAE','RMSE','MAPE']]
+    return df[['model', 'MAE', 'RMSE', 'MAPE']]
 
 
 def main():
@@ -274,10 +329,9 @@ def main():
     if uploaded_file is None:
         st.info("No file uploaded — using a built-in example (monthly retail sales). Upload your own in the sidebar to run on your data.")
         dates = pd.date_range(start='2015-01-01', periods=120, freq='M')
-        data = (np.sin(np.arange(120)/6) + np.arange(120)/20 + np.random.normal(0,0.3,120))*100 + 500
+        data = (np.sin(np.arange(120) / 6) + np.arange(120) / 20 + np.random.normal(0, 0.3, 120)) * 100 + 500
         df = pd.DataFrame({'ds': dates, 'y': data})
-        # add a sample categorical column
-        df['store'] = np.random.choice(['A','B','C'], size=len(df))
+        df['store'] = np.random.choice(['A', 'B', 'C'], size=len(df))
     else:
         df = read_uploaded_file(uploaded_file)
 
@@ -290,8 +344,8 @@ def main():
         with st.expander("Map columns (date & value)"):
             cols = df.columns.tolist()
             date_col = st.selectbox("Date column", cols, index=0)
-            value_col = st.selectbox("Value column", cols, index=1 if len(cols)>1 else 0)
-            freq = st.selectbox("Data frequency (if unknown pick 'infer')", ['infer','D','W','M','Q','H'])
+            value_col = st.selectbox("Value column", cols, index=1 if len(cols) > 1 else 0)
+            freq = st.selectbox("Data frequency (if unknown pick 'infer')", ['infer', 'D', 'W', 'M', 'Q', 'H'])
             if freq == 'infer':
                 try:
                     inferred = pd.infer_freq(pd.to_datetime(df[date_col]))
@@ -315,8 +369,8 @@ def main():
         with st.sidebar.expander("Forecast Settings", expanded=True):
             model_choice = st.selectbox("Model", ["Prophet", "SARIMAX", "Holt-Winters", "GradientBoosting"])
             periods = st.number_input("Forecast periods (horizon)", min_value=1, max_value=1000, value=12)
-            user_freq = st.selectbox("Frequency (pandas offset) e.g. 'M' monthly, 'D' daily", ['M','D','W','H'])
-            seasonality_mode = st.selectbox("Seasonality Mode (Prophet only)", ['additive','multiplicative'])
+            user_freq = st.selectbox("Frequency (pandas offset) e.g. 'M' monthly, 'D' daily", ['M', 'D', 'W', 'H'])
+            seasonality_mode = st.selectbox("Seasonality Mode (Prophet only)", ['additive', 'multiplicative'])
             yearly = st.checkbox("Yearly seasonality", value=True)
             weekly = st.checkbox("Weekly seasonality", value=False)
             daily = st.checkbox("Daily seasonality", value=False)
@@ -351,33 +405,43 @@ def main():
                                 holidays_df = pd.read_csv(holidays_file)
                             except Exception:
                                 st.error("Could not read holidays file; ensure two columns 'ds' and 'holiday'")
-                        m, fcst = forecast_with_prophet(working_df, date_col, value_col, periods, user_freq, seasonality_mode, yearly, weekly, daily, holidays_df)
+                        m, fcst = forecast_with_prophet(
+                            working_df, date_col, value_col, periods, user_freq, seasonality_mode, yearly, weekly, daily, holidays_df
+                        )
                         st.success("Forecast complete (Prophet)")
-                        # interactive plotly trace
                         hist = working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill')
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(x=hist.index, y=hist.values, mode='lines', name='history'))
-                        fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat'], mode='lines', name='forecast'))
-                        if 'yhat_lower' in fcst.columns:
-                            fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat_upper'], mode='lines', name='upper', line={'dash':'dash'}, visible='legendonly'))
+                        # Prophet returns many columns; prefer yhat
+                        if 'yhat' in fcst.columns:
+                            fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat'], mode='lines', name='forecast'))
+                        elif 'y' in fcst.columns:
+                            fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['y'], mode='lines', name='forecast'))
+                        if 'yhat_upper' in fcst.columns:
+                            fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat_upper'], mode='lines', name='upper', line={'dash': 'dash'}, visible='legendonly'))
                         st.plotly_chart(fig, use_container_width=True)
-                        out_df = fcst[['ds','yhat']].rename(columns={'yhat':'y'})
+                        if 'yhat' in fcst.columns:
+                            out_df = fcst[['ds', 'yhat']].rename(columns={'yhat': 'y'})
+                        elif 'y' in fcst.columns:
+                            out_df = fcst[['ds', 'y']]
+                        else:
+                            out_df = fcst[['ds']].copy()
 
                     elif model_choice == 'SARIMAX':
-                        order = (1,1,1)
-                        seasonal_order = (1,1,1,12) if user_freq=='M' else (1,1,1,7)
+                        order = (1, 1, 1)
+                        seasonal_order = (1, 1, 1, 12) if user_freq == 'M' else (1, 1, 1, 7)
                         res, fcst = sarimax_forecast(working_df, date_col, value_col, periods, user_freq, order, seasonal_order)
                         st.success("Forecast complete (SARIMAX)")
                         hist = working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill')
                         fig = go.Figure()
                         fig.add_trace(go.Scatter(x=hist.index, y=hist.values, name='history'))
                         fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat'], name='forecast'))
-                        fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat_upper'], name='upper', line={'dash':'dash'}, visible='legendonly'))
+                        fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat_upper'], name='upper', line={'dash': 'dash'}, visible='legendonly'))
                         st.plotly_chart(fig, use_container_width=True)
-                        out_df = fcst.rename(columns={'yhat':'y'})[['ds','y']]
+                        out_df = fcst.rename(columns={'yhat': 'y'})[['ds', 'y']]
 
                     elif model_choice == 'Holt-Winters':
-                        seasonal = st.selectbox("Seasonal type", ['add','mul'])
+                        seasonal = st.selectbox("Seasonal type", ['add', 'mul'])
                         seasonal_periods = st.number_input("Seasonal periods (e.g. 12 for monthly)", min_value=1, max_value=366, value=12)
                         res, fcst = holt_winters_forecast(working_df, date_col, value_col, periods, user_freq, seasonal, seasonal_periods)
                         st.success("Forecast complete (Holt-Winters)")
@@ -386,7 +450,7 @@ def main():
                         fig.add_trace(go.Scatter(x=hist.index, y=hist.values, name='history'))
                         fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat'], name='forecast'))
                         st.plotly_chart(fig, use_container_width=True)
-                        out_df = fcst.rename(columns={'yhat':'y'})[['ds','y']]
+                        out_df = fcst.rename(columns={'yhat': 'y'})[['ds', 'y']]
 
                     elif model_choice == 'GradientBoosting':
                         model, fcst = ml_forecast_with_gb(working_df, date_col, value_col, periods, user_freq)
@@ -396,7 +460,7 @@ def main():
                         fig.add_trace(go.Scatter(x=hist.index, y=hist.values, name='history'))
                         fig.add_trace(go.Scatter(x=fcst['ds'], y=fcst['yhat'], name='forecast'))
                         st.plotly_chart(fig, use_container_width=True)
-                        out_df = fcst.rename(columns={'yhat':'y'})[['ds','y']]
+                        out_df = fcst.rename(columns={'yhat': 'y'})[['ds', 'y']]
 
                     st.markdown("**Forecast sample (first rows)**")
                     st.dataframe(out_df.head(20))
@@ -409,34 +473,33 @@ def main():
                     try:
                         series = working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill')
                         metrics = None
-                        # define predict functions for holdout
+
                         def prophet_predict(train_series, h):
                             if Prophet is None:
                                 raise RuntimeError('Prophet not available')
                             m = Prophet(yearly_seasonality=yearly, weekly_seasonality=weekly, daily_seasonality=daily, seasonality_mode=seasonality_mode)
-                            df_train = pd.DataFrame({'ds':train_series.index, 'y':train_series.values})
+                            df_train = pd.DataFrame({'ds': train_series.index, 'y': train_series.values})
                             m.fit(df_train)
                             fut = m.make_future_dataframe(periods=h, freq=user_freq)
                             p = m.predict(fut)
                             return p.tail(h)['yhat']
 
                         def sarimax_predict(train_series, h):
-                            order = (1,1,1)
-                            seasonal_order = (1,1,1,12) if user_freq=='M' else (1,1,1,7)
+                            order = (1, 1, 1)
+                            seasonal_order = (1, 1, 1, 12) if user_freq == 'M' else (1, 1, 1, 7)
                             mod = sm.tsa.statespace.SARIMAX(train_series, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
                             res = mod.fit(disp=False)
                             pred = res.get_forecast(steps=h).predicted_mean
                             return pd.Series(pred.values, index=pd.date_range(start=train_series.index[-1] + pd.tseries.frequencies.to_offset(user_freq), periods=h, freq=user_freq))
 
                         def hw_predict(train_series, h):
-                            sp = 12 if user_freq=='M' else 7
+                            sp = 12 if user_freq == 'M' else 7
                             m = ExponentialSmoothing(train_series, trend='add', seasonal='add', seasonal_periods=sp)
                             r = m.fit(optimized=True)
                             p = r.forecast(steps=h)
                             return pd.Series(p.values, index=pd.date_range(start=train_series.index[-1] + pd.tseries.frequencies.to_offset(user_freq), periods=h, freq=user_freq))
 
                         def gb_predict(train_series, h):
-                            # simple fallback: persistence
                             return pd.Series(np.repeat(train_series.iloc[-1], h), index=pd.date_range(start=train_series.index[-1] + pd.tseries.frequencies.to_offset(user_freq), periods=h, freq=user_freq))
 
                         if model_choice == 'Prophet':
@@ -473,54 +536,47 @@ def main():
         if run_anom:
             try:
                 series = working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill')
+                # align context to series index so joins and masks match
+                context = working_df.set_index(date_col).reindex(series.index)
                 mask, scores = detect_anomalies(series, contamination=contamination)
-                anom_df = pd.DataFrame({'ds':series.index, 'y':series.values, 'is_anomaly':mask.values, 'score':scores.values})
-                # merge categorical context
-                context = working_df.set_index(date_col)
-                merged = anom_df.join(context[categorical_cols], how='left') if len(categorical_cols)>0 else anom_df.copy()
-
-                # explanations
+                anom_df = pd.DataFrame({'ds': series.index, 'y': series.values, 'is_anomaly': mask.values, 'score': scores.values})
+                merged = anom_df.set_index('ds').join(context[categorical_cols], how='left') if len(categorical_cols) > 0 else anom_df.set_index('ds').copy()
+                # now explanations: pass aligned context
                 explanations = explain_anomalies(context, mask, categorical_cols)
-                # build explanations map for quick lookup
                 explanations_map = {}
                 for ex in explanations:
                     col = ex['col']
                     for cat, frac in ex['top_anom'].items():
                         key = f"{col}||{cat}"
-                        # short narrative
                         delta = frac - ex['top_base'].get(cat, 0)
                         explanations_map[key] = f"{col}='{cat}' frequency delta vs baseline: {delta*100:.1f}%"
 
-                # create tooltip column
+                merged = merged.reset_index()
                 merged['tooltip'] = merged.apply(lambda r: create_anomaly_tooltip(r, categorical_cols, explanations_map), axis=1)
                 merged['marker_color'] = np.where(merged['is_anomaly'], 'red', 'blue')
                 merged['marker_symbol'] = np.where(merged['is_anomaly'], 'x', 'circle')
 
                 st.write(f"Detected {merged['is_anomaly'].sum()} anomalies out of {len(merged)} points")
 
-                # narrative summary
                 st.subheader('Narrative Summary')
-                if len(explanations)==0:
+                if len(explanations) == 0:
                     st.write('No strong categorical drivers detected (or none selected).')
                 else:
                     for ex in explanations:
                         st.markdown(f"**{ex['col']}** — Top categories during anomalies:")
-                        for k,v in ex['top_anom'].items():
+                        for k, v in ex['top_anom'].items():
                             st.write(f"- {k}: {v*100:.1f}% during anomalies")
                         for n in ex['narrative']:
                             st.caption(n)
 
-                # interactive chart with anomalies highlighted and hover
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(x=merged['ds'], y=merged['y'], mode='lines+markers', name='value', marker=dict(color=merged['marker_color'], symbol=merged['marker_symbol'], size=8), hoverinfo='text', hovertext=merged['tooltip']))
-                # explicitly draw anomaly points with red Xs for visibility
-                anoms = merged[merged['is_anomaly']==True]
+                anoms = merged[merged['is_anomaly'] == True]
                 if not anoms.empty:
-                    fig.add_trace(go.Scatter(x=anoms['ds'], y=anoms['y'], mode='markers+text', name='anomalies', marker=dict(color='red', size=12, symbol='x'), text=['Anomaly']*len(anoms), textposition='top center', hoverinfo='text', hovertext=anoms['tooltip']))
+                    fig.add_trace(go.Scatter(x=anoms['ds'], y=anoms['y'], mode='markers+text', name='anomalies', marker=dict(color='red', size=12, symbol='x'), text=['Anomaly'] * len(anoms), textposition='top center', hoverinfo='text', hovertext=anoms['tooltip']))
                 fig.update_layout(title='Series with anomalies highlighted', xaxis_title='Date', yaxis_title=value_col)
                 st.plotly_chart(fig, use_container_width=True)
 
-                # show anomaly table and allow download
                 st.markdown('---')
                 st.subheader('Anomaly table (top rows)')
                 st.dataframe(merged.sort_values('score').head(50))
@@ -534,7 +590,7 @@ def main():
         st.header("Model Compare")
         st.markdown("Run multiple models and compare forecast outputs and holdout metrics side-by-side.")
         with st.expander("Comparison settings"):
-            compare_models = st.multiselect("Select models to compare", ['Prophet', 'SARIMAX', 'Holt-Winters', 'GradientBoosting'], default=['Prophet','SARIMAX'])
+            compare_models = st.multiselect("Select models to compare", ['Prophet', 'SARIMAX', 'Holt-Winters', 'GradientBoosting'], default=['Prophet', 'SARIMAX'])
             comp_periods = st.number_input("Horizon for comparison", min_value=1, max_value=365, value=12)
             run_compare = st.button("Run Comparison")
         if run_compare:
@@ -545,57 +601,64 @@ def main():
                     try:
                         if mc == 'Prophet' and Prophet is not None:
                             m, fcst = forecast_with_prophet(working_df, date_col, value_col, comp_periods, user_freq, 'additive', True, False, False)
-                            out = fcst[['ds','yhat']].rename(columns={'yhat':'y'})
+                            if 'yhat' in fcst.columns:
+                                out = fcst[['ds', 'yhat']].rename(columns={'yhat': 'y'})
+                            elif 'y' in fcst.columns:
+                                out = fcst[['ds', 'y']]
+                            else:
+                                out = fcst[['ds']].copy()
                             results[mc] = out
-                            # metrics
                             def p_predict(train, h):
                                 m = Prophet(yearly_seasonality=True, weekly_seasonality=False)
-                                m.fit(pd.DataFrame({'ds':train.index, 'y':train.values}))
+                                m.fit(pd.DataFrame({'ds': train.index, 'y': train.values}))
                                 fut = m.make_future_dataframe(periods=h, freq=user_freq)
                                 return m.predict(fut).tail(h)['yhat']
                             met = compute_holdout_metrics(working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill'), mc, p_predict, user_freq)
-                            if met: metrics.append(met)
+                            if met:
+                                metrics.append(met)
 
                         elif mc == 'SARIMAX':
                             res, fcst = sarimax_forecast(working_df, date_col, value_col, comp_periods, user_freq)
-                            out = fcst.rename(columns={'yhat':'y'})[['ds','y']]
+                            out = fcst.rename(columns={'yhat': 'y'})[['ds', 'y']]
                             results[mc] = out
                             def s_predict(train, h):
-                                order = (1,1,1)
-                                seasonal_order = (1,1,1,12) if user_freq=='M' else (1,1,1,7)
+                                order = (1, 1, 1)
+                                seasonal_order = (1, 1, 1, 12) if user_freq == 'M' else (1, 1, 1, 7)
                                 mod = sm.tsa.statespace.SARIMAX(train, order=order, seasonal_order=seasonal_order, enforce_stationarity=False, enforce_invertibility=False)
                                 r = mod.fit(disp=False)
                                 return r.get_forecast(steps=h).predicted_mean
                             met = compute_holdout_metrics(working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill'), mc, s_predict, user_freq)
-                            if met: metrics.append(met)
+                            if met:
+                                metrics.append(met)
 
                         elif mc == 'Holt-Winters':
                             res, fcst = holt_winters_forecast(working_df, date_col, value_col, comp_periods, user_freq)
-                            out = fcst.rename(columns={'yhat':'y'})[['ds','y']]
+                            out = fcst.rename(columns={'yhat': 'y'})[['ds', 'y']]
                             results[mc] = out
                             def h_predict(train, h):
-                                sp = 12 if user_freq=='M' else 7
+                                sp = 12 if user_freq == 'M' else 7
                                 m = ExponentialSmoothing(train, trend='add', seasonal='add', seasonal_periods=sp)
                                 r = m.fit(optimized=True)
                                 return r.forecast(steps=h)
                             met = compute_holdout_metrics(working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill'), mc, h_predict, user_freq)
-                            if met: metrics.append(met)
+                            if met:
+                                metrics.append(met)
 
                         elif mc == 'GradientBoosting':
                             model, fcst = ml_forecast_with_gb(working_df, date_col, value_col, comp_periods, user_freq)
-                            out = fcst.rename(columns={'yhat':'y'})[['ds','y']]
+                            out = fcst.rename(columns={'yhat': 'y'})[['ds', 'y']]
                             results[mc] = out
                             def g_predict(train, h):
                                 return pd.Series(np.repeat(train.iloc[-1], h), index=pd.date_range(start=train.index[-1] + pd.tseries.frequencies.to_offset(user_freq), periods=h, freq=user_freq))
                             met = compute_holdout_metrics(working_df.set_index(date_col)[value_col].asfreq(user_freq).fillna(method='ffill'), mc, g_predict, user_freq)
-                            if met: metrics.append(met)
+                            if met:
+                                metrics.append(met)
 
                     except Exception as e:
                         st.warning(f"Model {mc} failed: {e}")
 
-                # plotting merged forecasts
                 merged = None
-                for k,v in results.items():
+                for k, v in results.items():
                     v2 = v.set_index('ds')
                     v2.columns = [k]
                     if merged is None:
@@ -608,8 +671,7 @@ def main():
                     combined = merged.reset_index()
                     download_df(combined, 'model_comparison_forecasts.csv')
 
-                # metrics table
-                if len(metrics)>0:
+                if len(metrics) > 0:
                     st.subheader('Comparison metrics (holdout)')
                     mdf = format_metrics_table(metrics)
                     st.dataframe(mdf)
